@@ -1,0 +1,32 @@
+models:
+  transformer:
+    learning_rate: 0.0005
+    feature_dim:  384 # cxr 1376,use 256 for medsam 768 for dino, 384
+    batch_size: 1
+    virtual_batch_size: 16
+    num_epochs: 50
+    patience: 15
+    cross_att_layers: 4
+    chest:
+      num_layers: 4
+      num_heads: 4
+      mlp_ratio: 4
+    ct:
+      num_layers: 4
+      num_heads: 4
+      mlp_ratio: 4
+    pet:
+      num_layers: 4
+      num_heads: 4
+      mlp_ratio: 4
+  conv:
+    learning_rate: 0.0005
+    feature_dim: 256
+    batch_size: 1
+    virtual_batch_size: 32
+    num_epochs: 50
+    patience: 15
+    ct:
+      div: 2
+    pet:
+      div: 2

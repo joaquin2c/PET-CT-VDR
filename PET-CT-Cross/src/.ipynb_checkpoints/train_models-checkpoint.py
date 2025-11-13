@@ -1,0 +1,1045 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Feb  6 07:53:47 2024
+
+@author: Mico
+"""
+import os
+import pandas as pd
+import numpy as np
+import json
+import h5py
+from tqdm import tqdm
+import plotly.graph_objs as go
+from plotly.subplots import make_subplots
+from skimage.transform import resize
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.metrics import classification_report, roc_auc_score
+import argparse
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from models_archs import (TransformerNoduleBimodalClassifier,
+                          NoduleClassifier,
+                          TransformerNoduleClassifier,
+                          save_checkpoint)
+from config_manager import load_conf
+
+
+def positional_encoding_3d(x, y, z, D, scale=10000):
+    x, y, z = np.asarray(x), np.asarray(y), np.asarray(z)
+    n_points = x.shape[0]
+    encoding = np.zeros((n_points, D))
+
+    for i in range(D // 6):
+        exponent = scale ** (6 * i / D)
+        encoding[:, 2*i] = np.sin(x / exponent)
+        encoding[:, 2*i + 1] = np.cos(x / exponent)
+        encoding[:, 2*i + D // 3] = np.sin(y / exponent)
+        encoding[:, 2*i + 1 + D // 3] = np.cos(y / exponent)
+        encoding[:, 2*i + 2 * D // 3] = np.sin(z / exponent)
+        encoding[:, 2*i + 1 + 2 * D // 3] = np.cos(z / exponent)
+
+    return encoding
+
+
+class PETCTDataset3D(Dataset):
+    def __init__(self, dataframe, label_encoder, hdf5_ct_path, hdf5_pet_path, modality_a='pet', modality_b='ct', use_augmentation=False, feature_dim=256, arch='conv'):
+        self.slice_per_modality = dataframe.groupby(['patient_id', 'modality'])['slice'].max()
+        self.df_ct = dataframe[dataframe['modality'] == modality_b].reset_index(drop=True)
+        self.df_pet = dataframe[dataframe['modality'] == modality_a].reset_index(drop=True)
+        self.modality_a = modality_a
+        self.modality_b = modality_b
+        if use_augmentation:
+            n_samples = len(self.df_ct['patient_id_new'].unique())
+            self.dataframe = self.df_ct.copy()
+            self.dataframe['patient_id_new_int'] = self.dataframe['patient_id_new'].str.split(':').str[-1]
+            self.dataframe['patient_id_new_int'] = self.dataframe['patient_id_new_int'].astype(int)
+            self.dataframe.sort_values(by='patient_id_new_int', inplace=True, ascending=False)
+            self.dataframe = self.dataframe.groupby(['patient_id'])[['modality', 'dataset', 'label', 'patient_id_new', 'patient_id_new_int']].first()
+            self.dataframe.reset_index(inplace=True, drop=False)
+            repeat_times = np.clip(np.ceil(n_samples / self.dataframe.shape[0]), 2, 8)
+            self.dataframe = pd.DataFrame(np.repeat(self.dataframe.values, repeat_times, axis=0), columns=self.dataframe.columns)
+        else:
+            self.dataframe = self.df_ct.groupby(['patient_id_new'])[['modality', 'dataset', 'label', 'patient_id']].first()
+            self.dataframe.reset_index(inplace=True, drop=False)
+
+        self.use_augmentation = use_augmentation
+
+        self.flip_angles = dataframe.groupby(['flip', 'angle'], as_index=False).size()[['flip', 'angle']]
+
+        self.df_ct = self.df_ct.set_index(['patient_id_new', 'angle', 'flip'])
+        self.df_pet = self.df_pet.set_index(['patient_id', 'angle', 'flip'])
+        self.df_ct = self.df_ct.sort_index()
+        self.df_pet = self.df_pet.sort_index()
+
+        self.hdf5_ct_path = hdf5_ct_path
+        self.hdf5_pet_path = hdf5_pet_path
+        self.label_encoder = label_encoder
+        self.feature_dim = feature_dim
+        self.arch = arch
+
+    def __len__(self):
+        return len(self.dataframe)
+
+    def __getitem__(self, idx):
+        enable_random_crop = True
+        noise_val = 10
+        sample = self.dataframe.iloc[idx]
+        patient_id_rew = sample.patient_id_new
+        patient_id = sample.patient_id
+        label = sample.label
+        noise = np.random.random(3) * noise_val - noise_val/2
+        scale_noise = np.random.uniform(0.85, 1.15)
+        if self.use_augmentation:
+            [[flip, angle]] = self.flip_angles.sample(n=1).values
+            patient_int = sample.patient_id_new_int
+            if patient_int > 0:
+                patient_int = np.random.randint(0, patient_int)
+            patient_id_rew = f'{patient_id}:{patient_int}'
+        else:
+            flip = 'None'
+            angle = 0
+            noise = noise * 0
+            scale_noise = 1.0
+
+        ct_slices = self.df_ct.loc[(patient_id_rew, angle, flip)]['slice'].values
+        start_slice_index, end_slice_index = ct_slices.argmin(), ct_slices.argmax()
+        if enable_random_crop:  # TODO: move to cfg file
+            if self.use_augmentation: # random slice crop
+                if len(ct_slices) > 7:
+                    window_size = int(np.random.randint(7, len(ct_slices), 1))
+                    start_slice_index = int(np.random.randint(0, len(ct_slices)-window_size))
+                    end_slice_index = int(start_slice_index + window_size)
+
+        feature_ids = self.df_ct.loc[(patient_id_rew, angle, flip)]['feature_id'].values[start_slice_index:end_slice_index]
+        spatial_res = self.df_ct.loc[(patient_id_rew, angle, flip)]['spatial_res'].values[0]
+        spatial_res = np.abs(spatial_res) * scale_noise
+        features_ct = self._get_features(self.hdf5_ct_path, patient_id, feature_ids, angle, flip, noise, spatial_res)
+        features_ct = torch.as_tensor(features_ct, dtype=torch.float32)
+
+        ct_slices = ct_slices[start_slice_index:end_slice_index] / self.slice_per_modality.loc[(patient_id, self.modality_b)]
+        start_slice, end_slice = ct_slices.min(), ct_slices.max()
+
+        max_slice = self.slice_per_modality[patient_id, self.modality_a]
+        start_slice = max(0, int(start_slice*max_slice))
+        end_slice = min(max_slice, int(end_slice*max_slice))
+
+        df_pet = self.df_pet.loc[(patient_id, angle, flip)]
+        spatial_res = df_pet['spatial_res'].values[0]
+        spatial_res = np.abs(spatial_res) * scale_noise
+        feature_ids = df_pet[np.logical_and(df_pet['slice'] >= start_slice, df_pet['slice'] <= end_slice)]['feature_id'].values
+        features_pet = self._get_features(self.hdf5_pet_path, patient_id, feature_ids, angle, flip, noise, spatial_res)
+        features_pet = torch.as_tensor(features_pet, dtype=torch.float32)
+
+        labels = np.array(label)
+        labels = np.expand_dims(labels, axis=-1)
+        labels = self.label_encoder.transform(labels.reshape(-1, 1)).toarray()
+        labels = torch.as_tensor(labels, dtype=torch.float32)
+            
+        return features_ct, features_pet, labels, patient_id, patient_id_rew
+
+    def _get_features(self, hdf5_path, patient_id, feature_ids, angle, flip, noise, spatial_res):
+        features = []
+        masks = []
+        use_mask = False
+
+        with h5py.File(hdf5_path, 'r') as h5f:
+            for feature_id in feature_ids:
+                slice_features = h5f[f'{patient_id}/features/{feature_id}'][()]
+                slice_mask_orig = h5f[f'{patient_id}/masks/{feature_id}'][()]
+                slice_mask = resize(slice_mask_orig, slice_features.shape[0:2], order=0)
+                slice_mask = np.expand_dims(slice_mask, axis=-1)
+                if self.arch == 'conv':
+                    features.append(slice_features * slice_mask)  # elementwise prod feature-mask
+                else:
+                    features.append(slice_features) 
+                masks.append(slice_mask)
+        features = np.transpose(np.stack(features, axis=0), axes=(3, 0, 1, 2))  # (slice, h, w, feat_dim) -> (feat_dim, slice, h, w)
+        if self.arch == 'transformer':
+            masks = np.transpose(np.stack(masks, axis=0), axes=(1, 2, 0, 3))  # (slice, h, w, 1) -> (h, w, slice, 1)
+            h_orig, w_orig = slice_mask_orig.shape[0:2]
+            features = np.transpose(features, axes=(2, 3, 1, 0))  # (h, w, slice, feat_dim)
+            h_new, w_new = features.shape[0], features.shape[1]
+
+            x, y, z = np.meshgrid(np.arange(0, features.shape[0]),
+                                  np.arange(0, features.shape[1]),
+                                  np.arange(0, features.shape[2]))
+            x = (x.flatten() / w_new).flatten() * w_orig * spatial_res[0]
+            y = (y.flatten() / h_new).flatten() * h_orig * spatial_res[1]
+            z = (z.flatten()).flatten() * spatial_res[2]
+
+            x = (x - x.mean() + noise[0])
+            y = (y - y.mean() + noise[1])
+            z = (z - z.mean() + noise[2])
+    
+            if use_mask:
+                masks = masks.flatten()
+                x = x[masks]
+                y = y[masks]
+                z = z[masks]
+
+            pe = positional_encoding_3d(x, y, z, D=self.feature_dim, scale=10000)
+            if use_mask:
+                features = features.reshape(-1, self.feature_dim)[masks, :] + pe / 4  # (seq_len, feat_dim)
+            else:
+                features = features.reshape(-1, self.feature_dim) + pe / 4 
+        return features
+
+
+class PETCTDataset3D_swin3d(Dataset):
+    def __init__(self, dataframe, label_encoder, hdf5_ct_path, hdf5_pet_path, modality_a='pet', modality_b='ct', use_augmentation=False, feature_dim=256, arch='conv'):
+        self.df_ct = dataframe[dataframe['modality'] == modality_b].reset_index(drop=True)
+        self.df_pet = dataframe[dataframe['modality'] == modality_a].reset_index(drop=True)
+        self.modality_a = modality_a
+        self.modality_b = modality_b
+        if use_augmentation:
+            n_samples = len(self.df_ct['patient_id'].unique())
+            self.dataframe = self.df_ct.copy()
+            self.dataframe = self.dataframe.groupby(['patient_id'])[['modality', 'dataset', 'label']].first()
+            self.dataframe.reset_index(inplace=True, drop=False)
+            repeat_times = np.clip(np.ceil(n_samples / self.dataframe.shape[0]), 2, 8)
+            self.dataframe = pd.DataFrame(np.repeat(self.dataframe.values, repeat_times, axis=0), columns=self.dataframe.columns)
+        else:
+            self.dataframe = self.df_ct.groupby(['patient_id'])[['modality', 'dataset', 'label']].first()
+            self.dataframe.reset_index(inplace=True, drop=False)
+
+        self.use_augmentation = use_augmentation
+
+        self.flip_angles = dataframe.groupby(['flip', 'angle'], as_index=False).size()[['flip', 'angle']]
+
+        self.df_ct = self.df_ct.set_index(['patient_id', 'angle', 'flip'])
+        self.df_pet = self.df_pet.set_index(['patient_id', 'angle', 'flip'])
+        self.df_ct = self.df_ct.sort_index()
+        self.df_pet = self.df_pet.sort_index()
+
+        self.hdf5_ct_path = hdf5_ct_path
+        self.hdf5_pet_path = hdf5_pet_path
+        self.label_encoder = label_encoder
+        self.feature_dim = feature_dim
+        self.arch = arch
+        print("Tamaño: ",self.__len__())
+
+    def __len__(self):
+        return len(self.dataframe)
+
+    def __getitem__(self, idx):
+        enable_random_crop = True
+        noise_val = 10
+        sample = self.dataframe.iloc[idx]
+        patient_id = sample.patient_id
+        label = sample.label
+        noise = np.random.random(3) * noise_val - noise_val/2
+        scale_noise = np.random.uniform(0.85, 1.15)
+        if self.use_augmentation:
+            [[flip, angle]] = self.flip_angles.sample(n=1).values
+        else:
+            flip = 'None'
+            angle = 0
+            noise = noise * 0
+            scale_noise = 1.0
+
+        data_ct=self.df_ct.loc[(patient_id, angle, flip)]
+        feature_id_ct = data_ct['feature_id']
+        #print("feature_id_ct",feature_id_ct)
+        #spatial_res_ct = data_ct['spatial_res']
+        #spatial_res_ct = np.abs(spatial_res_ct) * scale_noise
+        #print("ct")
+        features_ct = self._get_features(self.hdf5_ct_path, patient_id, feature_id_ct, angle, flip, noise)#, spatial_res_ct)
+        features_ct = torch.as_tensor(features_ct, dtype=torch.float32)
+
+        data_pet=self.df_pet.loc[(patient_id, angle, flip)]
+        feature_id_pet = data_pet['feature_id']
+        #spatial_res_pet = data_pet['spatial_res']
+        #spatial_res_pet = np.abs(spatial_res_pet) * scale_noise
+        #print("pet")
+        features_pet = self._get_features(self.hdf5_pet_path, patient_id, feature_id_pet, angle, flip, noise)#, spatial_res_pet)
+        features_pet = torch.as_tensor(features_pet, dtype=torch.float32)
+
+        labels = np.array(label)
+        labels = np.expand_dims(labels, axis=-1)
+        labels = self.label_encoder.transform(labels.reshape(-1, 1)).toarray()
+        labels = torch.as_tensor(labels, dtype=torch.float32)
+            
+        return features_ct, features_pet, labels, patient_id
+
+    def _get_features(self, hdf5_path, patient_id, feature_id, angle, flip, noise):#, spatial_res):
+
+        with h5py.File(hdf5_path, 'r') as h5f:
+            #print(f'ATH: {patient_id}/features/{feature_id}')
+            features = h5f[f'{patient_id}/features/{feature_id}'][()]
+            #print("features",features.shape)
+            mask_orig = h5f[f'{patient_id}/masks/{feature_id}'][()]
+            
+        """
+        h_orig, w_orig = mask_orig.shape[1:]
+        #print("tamaño:",features.shape)
+        features = np.transpose(features, axes=(2, 3, 1, 0))  # (h, w, slice, feat_dim)
+        h_new, w_new = features.shape[0], features.shape[1]
+
+        x, y, z = np.meshgrid(np.arange(0, features.shape[0]),
+                              np.arange(0, features.shape[1]),
+                              np.arange(0, features.shape[2]))
+        x = (x.flatten() / w_new).flatten() * w_orig * spatial_res[0]
+        y = (y.flatten() / h_new).flatten() * h_orig * spatial_res[1]
+        z = (z.flatten()).flatten() * spatial_res[2]
+
+        x = (x - x.mean() + noise[0])
+        y = (y - y.mean() + noise[1])
+        z = (z - z.mean() + noise[2])
+
+        pe = positional_encoding_3d(x, y, z, D=self.feature_dim, scale=10000)
+        features = features.reshape(-1, self.feature_dim) + pe / 4 
+        """        
+        #print("tamaño 2: ",features.shape)
+        return features
+
+
+def print_classification_report(report, global_metrics=None):
+    """ Display a sklearn like classification_report with extra metrics
+
+    Args:
+        report (dict): Sklearn classification_report .
+        global_metrics (list[str], optional): list of the extra global metrics.
+
+    """
+    df = pd.DataFrame(report)
+    df = df.round(3)
+
+    if global_metrics is None:
+        global_metrics = ['accuracy', 'ROC AUC', 'kfold', 'loss', 'epoch', 'split']
+    headers = df.index.to_list()
+
+    df = df.T.astype(str)
+    support = df.loc['macro avg'].iloc[-1]
+
+    for row in global_metrics:
+        metric_val = df.loc[row].iloc[-2]
+        new_row = [' ']*len(headers)
+        new_row[-2] = metric_val
+        new_row[-1] = support
+        df.loc[row] = new_row
+
+    local_metrics = [col for col in df.T.columns if col not in global_metrics]
+    df_local = df.loc[local_metrics]
+    df_global = df.loc[global_metrics].T[-2:-1]
+    df_global.index = ['   ']
+
+    final_str = f'\n{df_global}\n\n{df_local}\n\n'
+    #print(final_str)
+    return final_str
+
+
+def plot_loss_metrics(df_loss, title):
+    """ Plot loss vs epoch with the standard desviation between kfolds
+
+    Args:
+        df_loss (pd.dataframe): dataframe with the training loss metrics.
+
+    Returns:
+        fig (plotly.graph_objects.Figure): plotly figure.
+
+    """
+    metric_names = ['Loss', 'AUC', 'F1', 'Target_metric']
+    plot_grid = [[1, 1], [1, 2], [2, 1], [2, 2]]
+    fig = make_subplots(rows=2,
+                        shared_xaxes=True,
+                        cols=2,
+                        subplot_titles=metric_names)
+    for plot_i, metric_name in enumerate(metric_names):
+        metric_name = metric_name.lower()
+        if f'train_{metric_name}' in df_loss.columns:
+            fig.append_trace(go.Scatter(x=df_loss['epoch'],
+                                        y=df_loss[f'train_{metric_name}'],
+                                        mode='lines+markers',
+                                        marker_color='red',
+                                        name=f'train_{metric_name}',
+                                        hovertext=df_loss['train_report']
+                                        ),
+                             row=plot_grid[plot_i][0], col=plot_grid[plot_i][1])
+            fig.append_trace(go.Scatter(x=df_loss['epoch'],
+                                        y=df_loss[f'test_{metric_name}'],
+                                        mode='lines+markers',
+                                        marker_color='blue',
+                                        name=f'test_{metric_name}',
+                                        hovertext=df_loss['test_report']
+                                        ),
+                             row=plot_grid[plot_i][0], col=plot_grid[plot_i][1])
+        else:
+            fig.append_trace(go.Scatter(x=df_loss['epoch'],
+                                        y=df_loss[f'{metric_name}'],
+                                        mode='lines+markers',
+                                        marker_color='green',
+                                        name=f'{metric_name}',
+                                        hovertext=df_loss['is_improvement']),
+                             row=plot_grid[plot_i][0], col=plot_grid[plot_i][1])
+    fig.update_layout(title_text=title.capitalize(), xaxis_title="Epochs",)
+    return fig
+
+
+def create_labelmap(label_names):
+    """ Create a labelmap from a list labels
+
+    Args:
+        label_names (list): list of labels.
+
+    Returns:
+        labelmap (dict): to convert label_id to label_name.
+        labelmap_inv (dict): to convert label_name to label_id.
+
+    """
+    labelmap = dict(zip(np.arange(0, len(label_names)), label_names))
+    labelmap_inv = dict(zip(label_names, np.arange(0, len(label_names))))
+    return labelmap, labelmap_inv
+
+
+def get_y_true_and_pred(y_true, y_pred, cpu=False):
+    """ Check tensor sizes and apply softmax to get y_score
+
+    Args:
+        y_true (torch.tensor): batch of one-hot encoding true labels.
+        y_pred (torch.tensor): batch of prediction logits.
+        cpu (bool, optional): return tensors as numpy arrays. Defaults to False.
+
+    Returns:
+        y_true (torch.tensor or np.array): true labels.
+        y_score (torch.tensor or np.array): pred labels probabilities.
+
+    """
+    y_true = torch.squeeze(y_true)
+    y_pred = torch.squeeze(y_pred)
+    assert y_pred.size() == y_true.size()
+
+    if len(y_true.shape) == 1:
+        y_pred = torch.unsqueeze(y_pred, 0)
+        y_true = torch.unsqueeze(y_true, 0)
+
+    y_score = F.softmax(y_pred, dim=1)
+    y_true = torch.argmax(y_true, dim=1)
+
+    if cpu:
+        y_true = y_true.detach().cpu().numpy()
+        y_score = y_score.detach().cpu().numpy()
+
+    return y_true, y_score
+
+
+def get_sampler_weights(train_labels):
+    """ Compute the sampler weights of the train dataloader
+
+    Args:
+        train_labels (np.array): labels of the train dataloader.
+
+    Returns:
+        weights (list): a weight for each element in the dataloader.
+
+    """
+
+    label_value, counts = np.unique(train_labels, return_counts=True)
+    labels_counts = dict(zip(label_value, counts))
+    weights = [1/labels_counts[lb] for lb in train_labels]
+
+    return weights
+
+
+class CrossModalFocalLoss(nn.Module):
+    """
+     Multi-class Cross Modal Focal Loss
+    """
+    def __init__(self, gamma_bimodal=0, gamma_unimodal=2, alpha=None, beta=0.5):
+        super(CrossModalFocalLoss, self).__init__()
+        self.gamma_bimodal = gamma_bimodal
+        self.gamma_unimodal = gamma_unimodal
+        self.alpha = alpha
+        self.beta = beta
+        self.eps = 1e-8
+
+    def forward(self, inputs_petct, inputs_ct, inputs_pet, targets):
+        """
+        inputs_petct: [N, C], float32
+        inputs_ct: [N, C], float32
+        inputs_pet: [N, C], float32
+        target: [N, ], int64
+        """
+        if len(inputs_petct.shape) == 1:
+            inputs_petct = torch.unsqueeze(inputs_petct, 0)
+            inputs_ct = torch.unsqueeze(inputs_ct, 0)
+            inputs_pet = torch.unsqueeze(inputs_pet, 0)
+            targets = torch.unsqueeze(targets, 0)
+        class_indices = torch.argmax(targets, dim=1)
+
+        logpt_petct = F.log_softmax(inputs_petct, dim=1)
+        logpt_ct = F.log_softmax(inputs_ct, dim=1)
+        logpt_pet = F.log_softmax(inputs_pet, dim=1)
+
+        pt_petct = torch.exp(logpt_petct)
+        logpt_petct = (1-pt_petct)**self.gamma_bimodal * logpt_petct
+        loss_petct = F.nll_loss(logpt_petct, class_indices, self.alpha, reduction='mean')
+
+        pt_ct = torch.exp(logpt_ct)
+        pt_pet = torch.exp(logpt_pet)
+
+        pt_mean = (2*pt_ct*pt_pet) / (pt_ct + pt_pet + self.eps)
+
+        logpt_ct = (1-pt_mean*pt_ct)**self.gamma_unimodal * logpt_ct
+        loss_ct = F.nll_loss(logpt_ct, class_indices, self.alpha, reduction='mean')
+
+        logpt_pet = (1-pt_mean*pt_pet)**self.gamma_unimodal * logpt_pet
+        loss_pet = F.nll_loss(logpt_pet, class_indices, self.alpha, reduction='mean')
+
+        loss = (self.beta*loss_petct + (1-self.beta)*(loss_ct + loss_pet))
+        return loss
+
+
+class FocalLoss(nn.Module):
+    """
+     Multi-class Focal Loss
+    """
+    def __init__(self, gamma=2, alpha=None):
+        super(FocalLoss, self).__init__()
+        self.gamma = gamma
+        self.weight = alpha
+
+    def forward(self, inputs, targets):
+        """
+        input: [N, C], float32
+        target: [N, ], int64
+        """
+        if len(inputs.shape) == 1:
+            inputs = torch.unsqueeze(inputs, 0)
+            targets = torch.unsqueeze(targets, 0)
+        class_indices = torch.argmax(targets, dim=1)
+
+        logpt = F.log_softmax(inputs, dim=1)
+
+        pt = torch.exp(logpt)
+        logpt = (1-pt)**self.gamma * logpt
+        
+        loss = F.nll_loss(logpt, class_indices, self.weight, reduction='sum')
+        return loss
+
+
+def find_divisor(slice_count, modality):
+    if modality == 'ct' or modality == 'chest':
+        desired_slices = 13
+    else:
+        desired_slices = 2
+    return np.clip(desired_slices, 1, slice_count)
+
+
+def prepare_df(df, modality_a='pet', modality_b='ct'): ########CONTINUE
+    df['divisor'] = 1
+    slices_per_patient = df.groupby(['patient_id', 'modality'])[['slice', 'divisor']].max()
+    slices_per_patient.describe()
+
+    slices_per_patient['divisor'] = slices_per_patient.apply(lambda x: find_divisor(x['slice'], modality=x.name[1]), axis=1)
+    slices_per_patient = slices_per_patient['divisor'].to_dict()
+
+    df['divisor'] = df[['patient_id', 'modality']].apply(lambda x: slices_per_patient[(x[0], x[1])], axis=1) 
+
+    df['patient_id_new'] = df.apply(lambda row: f"{row['patient_id']}:{np.ceil(row['slice']/row['divisor']).astype(int)}", axis=1)
+
+    df_pet = df[df['modality'] == modality_a]
+    df_ct = df[df['modality'] == modality_b]
+
+    patient_ids = df_ct['patient_id'].unique()
+    df_aux = []
+    for patient_id in patient_ids:
+        df_patient = df_ct[df_ct['patient_id'] == patient_id]
+        window_size = df_patient['divisor'].max()
+        slices = df_patient['slice'].unique()
+        min_slice = slices.min()
+        max_slice = slices.max()
+
+        for sample_i, slice_i in enumerate(range(0, len(slices)-window_size)):
+            mask = np.logical_and(df_patient['slice'] >= slice_i, df_patient['slice'] <= slice_i+window_size)
+            df_patient.loc[mask,'patient_id_new'] = f'{patient_id}:{sample_i}'
+            df_aux.append(df_patient[mask])
+    df_ct = pd.concat(df_aux, axis=0)
+    df = pd.concat([df_ct, df_pet], axis=0)
+    df.reset_index(drop=True, inplace=True)
+
+    return df
+
+def get_number_of_params(model):
+    model_parameters = filter(lambda p: p.requires_grad, model.parameters())
+    param_count = sum([np.prod(p.size()) for p in model_parameters])
+    return param_count
+
+def build_model(cfg, arch, modality, modality_a, modality_b,type_cross_att,cross_pos, num_classes=2):
+    cfg_model = cfg['models'][arch]
+    feature_dim = cfg_model['feature_dim']
+    if modality == 'petct' or modality == 'petchest':
+        mlp_ratio_ct = cfg_model[modality_b]['mlp_ratio']
+        mlp_ratio_pet = cfg_model[modality_a]['mlp_ratio']
+
+        num_heads_ct = cfg_model[modality_b]['num_heads']
+        num_heads_pet = cfg_model[modality_a]['num_heads']
+
+        num_layers_ct = cfg_model[modality_b]['num_layers']
+        num_layers_pet = cfg_model[modality_a]['num_layers']
+
+        num_layers_cross_att = cfg_model["cross_att_layers"]
+
+        model = TransformerNoduleBimodalClassifier(feature_dim,
+                                                   mlp_ratio_ct, mlp_ratio_pet,
+                                                   num_heads_ct, num_heads_pet,
+                                                   num_layers_ct, num_layers_pet,
+                                                   num_layers_cross_att, type_cross_att, 
+                                                   cross_pos,num_classes=num_classes)
+    elif arch == 'conv':
+        div = cfg['models'][arch][modality]['div']
+        model = NoduleClassifier(input_dim=feature_dim, num_classes=num_classes, div=div)
+    else:
+        mlp_ratio = cfg_model[modality]['mlp_ratio']
+        num_heads = cfg_model[modality]['num_heads']
+        num_layers = cfg_model[modality]['num_layers']
+        dim_feedforward = int(feature_dim*mlp_ratio)
+        model = TransformerNoduleClassifier(input_dim=feature_dim,
+                                            dim_feedforward=dim_feedforward,
+                                            num_heads=num_heads,
+                                            num_classes=num_classes,
+                                            num_layers=num_layers)
+    return model
+
+
+def get_label_encoder(df):
+    EGFR_names = list(df['label'].unique())
+    EGFR_names.sort()
+    EGFR_lm, EGFR_lm_inv = create_labelmap(EGFR_names)
+    
+    EGFR_encoder = OneHotEncoder(handle_unknown='ignore')
+    EGFR_encoder.fit(np.array(list(EGFR_lm.keys())).reshape(-1, 1))
+    return EGFR_encoder
+
+def my_collate_fn(data):
+    # TODO: Implement your function
+    # But I guess in your case it should be:
+    return tuple(data)
+
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Train 3D transoformer or CNN for lung nodules clasification")
+    parser.add_argument("-a", "--arch", type=str, default="transformer",
+                        help="'transformer' or 'conv'")
+    parser.add_argument("-d", "--dataset", type=str, default="stanford",
+                        help="dataset 'stanford' or 'santa_maria'")
+    parser.add_argument("-b", "--backbone", type=str, default="medsam",
+                        help="backbone ViT encoder 'medsam' or 'dinov2'")
+    parser.add_argument("-m", "--modality", type=str, default="petchest",
+                        help="'ct', 'pet', 'chest', 'petct' or 'petchest' ")
+    parser.add_argument("-t", "--type", type=str, default="bi_cross_attention",
+                        help="'bi_cross_attention' or 'cross_attention'")
+    parser.add_argument("-cp", "--cross_pos", type=str, default="before",
+                        help="'before' or 'after'")
+    parser.add_argument("-gpu", "--gpu", type=int, default=0,
+                        help="id of gpu device, default is cuda:0")
+    parser.add_argument("-l", "--loss", type=str, default='focal',
+                        help="'focal' 'crossmodal'")
+    parser.add_argument("-e", "--experiment", type=str, default='petct',
+                        help="experiment name")
+    parser.add_argument("-p", "--path", type=str, default=os.path.join('../../../Data/PET-CT/data', 'features_no_petliver'),
+                        help="threshold for classification")
+    
+    
+    #python train_models.py -d stanford -b medsam -m petct -gpu 0 -l crossmodal -p ../../../Data/PET-CT/data/features_norm_correct -e medsam_cross_norm_correct
+    args = parser.parse_args()
+
+    arch = args.arch
+    backbone = args.backbone
+    modality = args.modality
+    gpu_id = args.gpu
+    use_sampler = True
+    arg_dataset = args.dataset
+    loss_func = args.loss
+    cross_pos = args.cross_pos
+    type_cross_att = args.type
+    experiment_name = args.experiment
+    threshold=0.5
+    folder_path=args.path
+    desired_datasets = [arg_dataset]
+
+    modality_a = 'pet'
+    if 'chest' in modality:
+        modality_b = 'chest'
+    else:
+        modality_b = 'ct'
+
+    hdf5_pet_path = os.path.join(folder_path, f'features_masks_{modality_a}.hdf5')
+    hdf5_ct_path = os.path.join(folder_path, f'features_masks_{modality_b}.hdf5')
+    df_path = os.path.join(folder_path, 'petct.parquet')
+    models_save_dir = os.path.join('../data/PET-CT', 'models', experiment_name, f'{backbone}_{arch}_{arg_dataset}')
+
+    cfg = load_conf()
+
+    # load dataframe and apply some filter criteria
+    df = pd.read_parquet(df_path)
+    df['flip'] = df['flip'].astype(str)
+    df.reset_index(drop=True, inplace=True)
+    if backbone!="swin3D":
+        df = prepare_df(df, modality_a, modality_b)
+
+    # create labelmap and onehot enconder for nodule EGFR mutation
+    EGFR_encoder = get_label_encoder(df)
+    train_metrics = {'kfold': [],
+                     'epoch': [],
+                     'train_loss': [],
+                     'test_loss': [],
+                     'train_auc': [],
+                     'test_auc': [],
+                     'train_f1': [],
+                     'test_f1': [],
+                     'train_report': [],
+                     'test_report': []}
+
+    # use KFold to split patients stratified by label
+    print("begin training!!\n")
+    pd_datas_train=pd.DataFrame(columns=["kfold","epoch","patient","patient_slices","class_real","class_1_prob"],dtype="object")
+    pd_datas_val=pd.DataFrame(columns=["kfold","epoch","patient","patient_slices","class_real","class_1_prob"],dtype="object")
+
+    if backbone=="swin3D":
+        patients = torch.load("../parameters_kfold_swin3d.yaml",weights_only=True)
+        #print(patients)
+        folds = patients.keys()
+    else:
+        if arg_dataset=="all":
+            folds=[0,1,2,3,4]
+        else:
+            folds = list(cfg['kfold_patients'][modality_b][arg_dataset].keys())
+            
+    for kfold in tqdm(folds, desc='kfold', leave=False, position=0):
+        save_dir = os.path.join(models_save_dir, modality, f'kfold_{kfold}')
+        os.makedirs(save_dir, exist_ok=True)
+
+        # get patient_ids of each split
+        
+        if backbone!="swin3D":
+            training_patients=patients[kfold]["train"]
+            testing_patients=patients[kfold]["test"]
+        else:
+            training_patients=[]
+            testing_patients=[]
+            if arg_dataset=="all":
+                print("\nUsing all datasets\n")
+                training_patients.append(cfg['kfold_patients'][modality_b]["stanford"][kfold]['train'])
+                training_patients.append(cfg['kfold_patients'][modality_b]["santa_maria"][kfold]['train'])
+                training_patients=np.concatenate(training_patients)
+                
+                testing_patients.append(cfg['kfold_patients'][modality_b]["stanford"][kfold]['test'])
+                testing_patients.append(cfg['kfold_patients'][modality_b]["santa_maria"][kfold]['test'])
+                testing_patients=np.concatenate(testing_patients)
+            else:
+                training_patients = cfg['kfold_patients'][modality_b][arg_dataset][kfold]['train']
+                testing_patients = cfg['kfold_patients'][modality_b][arg_dataset][kfold]['test']
+
+        # filter dataframes based on the split patients
+
+        df_train = df[df['patient_id'].isin(training_patients)]
+        df_test = df[df['patient_id'].isin(testing_patients)]
+
+        df_train.reset_index(drop=True, inplace=True)
+        df_test.reset_index(drop=True, inplace=True)
+
+        cfg_model = cfg['models'][arch]
+        learning_rate = cfg_model['learning_rate']
+        feature_dim = cfg_model['feature_dim']
+        batch_size = cfg_model['batch_size']  # TODO: add support for bigger batches using zero padding to create batches of the same size
+        virtual_batch_size = cfg_model['virtual_batch_size']
+        start_epoch = 0 # TODO: make it able to start from a checkpoint
+        num_epochs = cfg_model['num_epochs']
+        best_roc_auc_test=0
+
+        # Create model instance
+        model = build_model(cfg, arch, modality, modality_a, modality_b, type_cross_att,cross_pos,num_classes=2)
+
+        print(model)
+        print(get_number_of_params(model))
+        device = f'cuda:{gpu_id}'
+        model = model.to(device)
+
+        if loss_func == 'crossmodal':
+            print("Using CrossModal loss")
+            criterion = CrossModalFocalLoss(alpha=torch.tensor([0.25, 0.75]).to(device),
+                                            gamma_unimodal=2.0,
+                                            gamma_bimodal=1.0,
+                                            beta=0.6)
+        else:
+            print("Using Focal loss")
+            criterion = FocalLoss(alpha=torch.tensor([0.25, 0.75]).to(device), gamma=2.0)
+
+        optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01, amsgrad=False)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs*0.8, eta_min=0.0001)
+
+        # create datasets
+        if backbone=="swin3D":
+            print("\n\n Using swin3D \n\n")
+            PETCTDataset=PETCTDataset3D_swin3d
+        else:
+            PETCTDataset=PETCTDataset3D
+  
+        train_dataset = PETCTDataset(df_train,
+                                       label_encoder=EGFR_encoder,
+                                       hdf5_ct_path=hdf5_ct_path,
+                                       hdf5_pet_path=hdf5_pet_path,
+                                       modality_a=modality_a,
+                                       modality_b=modality_b,
+                                       use_augmentation=True,
+                                       feature_dim=feature_dim,
+                                       arch=arch)
+    
+        test_dataset = PETCTDataset(df_test,
+                                      label_encoder=EGFR_encoder,
+                                      hdf5_ct_path=hdf5_ct_path,
+                                      hdf5_pet_path=hdf5_pet_path,
+                                      modality_a=modality_a,
+                                      modality_b=modality_b,
+                                      use_augmentation=False,
+                                      feature_dim=feature_dim,
+                                      arch=arch)
+
+        # create a sampler to balance training classes proportion
+        if use_sampler:
+            train_labels = np.array(list(train_dataset.dataframe.label.values))
+            sampler_weights = get_sampler_weights(train_labels)
+            sampler = WeightedRandomSampler(sampler_weights, len(train_dataset), replacement=True)
+
+            # create data loaders
+            train_loader = DataLoader(train_dataset, batch_size=16, shuffle=False, sampler=sampler,collate_fn=my_collate_fn)
+            test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
+        else:
+            train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+            test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+
+        with tqdm(total=num_epochs, desc='epoch', position=1, leave=False) as batch_pbar:
+            for epoch in range(start_epoch, start_epoch+num_epochs):
+                # reset loss, labels and predictions to compute epoch metrics
+                total_train_loss = 0
+                total_test_loss = 0
+
+                y_true_train = []
+                y_score_train = []
+                patient_ids_train = []
+
+                #y_true_test = []
+                #y_score_test = []
+                patient_ids_test = []
+
+                # train loop
+                model.train()
+                optimizer.zero_grad()
+                i = 0
+                iters_to_accumulate = min(virtual_batch_size, len(train_loader))
+                epoch_data_train={"kfold":[],"epoch":[],"patient":[],"patient_slices":[],"class_real":[],"class_1_prob":[]}
+                for batches in tqdm(train_loader, position=2, desc='train batch'):
+                    #ct_batches, pet_batches, labels_batches, patient_id_batches,patient_id_rewes
+                    #print("\nSize: ",len(bb[0]),"\n")
+                    for i in range(len(batches)):
+                        ct_batch, pet_batch, labels_batch, patient_id_batch=batches[i]
+                    
+                        ct_batch=ct_batch.unsqueeze(0)
+                        pet_batch=pet_batch.unsqueeze(0)
+                        labels_batch=labels_batch
+                        patient_id_batch=patient_id_batch
+                        patient_id_rew=0
+                        """
+                        for xd in pet_batch:
+                            contains_nan = np.isnan(np.array(xd)).any()
+                            print("Array contains NaN:", contains_nan,patient_id_batch,patient_id_rew)
+
+                        """
+                        labels_batch = torch.squeeze(labels_batch).to(device)
+                        if modality == 'petct' or modality == 'petchest':
+                            ct_batch = ct_batch.to(device)
+                            pet_batch = pet_batch.to(device)
+                            outputs = model(ct_batch, pet_batch)
+                        elif modality == 'pet':
+                            pet_batch = pet_batch.to(device)
+                            outputs = model(pet_batch)
+                        elif modality == 'ct' or modality == 'chest':
+                            ct_batch = ct_batch.to(device)
+                            outputs = model(ct_batch)
+                        if loss_func == 'crossmodal':
+                            loss = criterion(torch.squeeze(outputs[0]),
+                                             torch.squeeze(outputs[2]),
+                                             torch.squeeze(outputs[3]),
+                                             labels_batch) / iters_to_accumulate
+                        else:
+                            loss = criterion(torch.squeeze(outputs[0]), labels_batch) / iters_to_accumulate
+                        y_true, y_score = get_y_true_and_pred(y_true=labels_batch, y_pred=outputs[0], cpu=True)
+
+                        
+                        #y_true_train.append(y_true)
+                        #y_score_train.append(y_score)
+                        patient_ids_train.append(np.array(patient_id_batch))
+    
+                        total_train_loss += loss.item() * iters_to_accumulate
+    
+                        loss.backward()
+    
+                        #if (i + 1) % iters_to_accumulate == 0 or i + 1 == len(train_loader):
+                        #i += 1
+    
+                    
+                        epoch_data_train["kfold"].append(kfold)
+                        epoch_data_train["epoch"].append(epoch)
+                        epoch_data_train["patient"].append(patient_id_batch)
+                        epoch_data_train["patient_slices"].append(patient_id_rew)
+                        epoch_data_train["class_real"].append(y_true[0])
+                        epoch_data_train["class_1_prob"].append(y_score[0][1])
+                    optimizer.step()
+                    optimizer.zero_grad()
+                
+                # test loop
+                model.eval()
+                epoch_data_val={"kfold":[],"epoch":[],"patient":[],"patient_slices":[],"class_real":[],"class_1_prob":[]}
+                with torch.no_grad():
+                    for ct_batch, pet_batch, labels_batch, patient_id_batch in tqdm(test_loader, position=2, desc='test batch'):
+                        labels_batch = torch.squeeze(labels_batch).to(device)
+                        if modality == 'petct' or modality == 'petchest':
+                            ct_batch = ct_batch.to(device)
+                            pet_batch = pet_batch.to(device)
+                            outputs = model(ct_batch, pet_batch)
+                        elif modality == 'pet':
+                            pet_batch = pet_batch.to(device)
+                            outputs = model(pet_batch)
+                        elif modality == 'ct' or modality == 'chest':
+                            ct_batch = ct_batch.to(device)
+                            outputs = model(ct_batch)
+                        if loss_func == 'crossmodal':
+                            loss = criterion(torch.squeeze(outputs[0]),
+                                             torch.squeeze(outputs[2]),
+                                             torch.squeeze(outputs[3]),
+                                             labels_batch)
+                        else:
+                            loss = criterion(torch.squeeze(outputs[0]), labels_batch)
+                        y_true, y_score = get_y_true_and_pred(y_true=labels_batch, y_pred=outputs[0], cpu=True)
+
+                        #print(patient_id_batch[0],patient_id_rew[0])
+                        patient_ids_test.append(np.array(patient_id_batch))
+                        epoch_data_val["kfold"].append(kfold)
+                        epoch_data_val["epoch"].append(epoch)
+                        epoch_data_val["patient"].append(patient_id_batch[0])
+                        epoch_data_val["patient_slices"].append(0)
+                        epoch_data_val["class_real"].append(y_true[0])
+                        epoch_data_val["class_1_prob"].append(y_score[0][1])
+                        total_test_loss += loss.item()
+
+                
+                pd_epoch_train=pd.DataFrame(epoch_data_train)
+                pd_epoch_val=pd.DataFrame(epoch_data_val)
+                
+                pd_epoch_patient_train=pd_epoch_train.groupby("patient").max().reset_index()
+                pd_epoch_patient_val=pd_epoch_val.groupby("patient").max().reset_index()
+                #print(np.array(pd_epoch["class_predict"]))
+                pd_datas_train=pd_epoch_train if pd_datas_train.empty else pd.concat([pd_datas_train, pd_epoch_train]) 
+                pd_datas_val=pd_epoch_val if pd_datas_val.empty else pd.concat([pd_datas_val, pd_epoch_val])
+                
+                pd_datas_train.to_csv(os.path.join(models_save_dir, modality,'epoch_train_results.csv'), index=False) 
+                pd_datas_val.to_csv(os.path.join(models_save_dir, modality,'epoch_val_results.csv'), index=False) 
+
+                
+                y_true_train=np.array(pd_epoch_patient_train["class_real"])
+                y_score_train=np.array(pd_epoch_patient_train["class_1_prob"])
+                
+                #print(pd_epoch_patient_train)
+                #print("y_true_train",y_true_train)
+                #print("y_score_train",y_score_train)
+                
+                y_true_test=np.array(pd_epoch_patient_val["class_real"])
+                y_score_test=np.array(pd_epoch_patient_val["class_1_prob"])
+                
+                scheduler.step()
+                avg_train_loss = total_train_loss / len(train_loader)
+                avg_test_loss = total_test_loss / len(test_loader)
+
+                batch_pbar.set_postfix({'Train Loss': avg_train_loss, 'Test Loss': avg_test_loss})
+                batch_pbar.update()
+
+                # generate y_true and y_pred for each split in the epoch
+                # aggregate predictions and metrics per patient_id
+                patient_ids_train = np.array(patient_ids_train)
+                patient_ids_test = np.concatenate(patient_ids_test, axis=0)
+
+                #sample_weight_train = get_sampler_weights(patient_ids_train)
+                #sample_weight_test = get_sampler_weights(patient_ids_test)
+
+                #y_score_train = np.concatenate(y_score_train, axis=0)[:, 1]
+                #y_true_train == np.concatenate(y_true_train, axis=0)
+                y_pred_train = (y_score_train >= threshold)*1
+
+                #y_score_test = np.concatenate(y_score_test, axis=0)[:, 1]
+                #y_true_test == np.concatenate(y_true_test, axis=0)
+                y_pred_test = (y_score_test >= threshold)*1
+
+                # create a clasification report of each split
+                #print(pd_epoch_patient_train)
+                roc_auc_test = roc_auc_score(y_true_test, y_score_test)
+                roc_auc_train = roc_auc_score(y_true_train, y_score_train)#, sample_weight=sample_weight_train)
+
+                train_report = classification_report(y_true_train, y_pred_train,
+                                                     output_dict=True, zero_division=0)
+                                                     #sample_weight=sample_weight_train)
+                train_report['ROC AUC'] = roc_auc_train
+                train_report['kfold'] = kfold
+                train_report['loss'] = avg_train_loss
+                train_report['epoch'] = epoch
+                train_report['split'] = 'train'
+
+                test_report = classification_report(y_true_test, y_pred_test,
+                                                    output_dict=True, zero_division=0)
+                test_report['ROC AUC'] = roc_auc_test
+                test_report['kfold'] = kfold
+                test_report['loss'] = avg_test_loss
+                test_report['epoch'] = epoch
+                test_report['split'] = 'test'
+
+                train_report_str = print_classification_report(train_report)
+                test_report_str = print_classification_report(test_report)
+
+                # save train and test clasification reports into a json file
+                with open(os.path.join(save_dir, f'train_metrics_{epoch}.json'), 'w') as file:
+                    json.dump(train_report, file)
+
+                with open(os.path.join(save_dir, f'test_metrics_{epoch}.json'), 'w') as file:
+                    json.dump(test_report, file)
+
+                # save a plot of the train an test loss
+                train_metrics['kfold'].append(kfold)
+                train_metrics['epoch'].append(epoch)
+                train_metrics['train_loss'].append(avg_train_loss)
+                train_metrics['test_loss'].append(avg_test_loss)
+                train_metrics['train_auc'].append(roc_auc_train)
+                train_metrics['test_auc'].append(roc_auc_test)
+                train_metrics['train_f1'].append(train_report['macro avg']['f1-score'])
+                train_metrics['test_f1'].append(test_report['macro avg']['f1-score'])
+                train_metrics['train_report'].append(train_report_str.replace('\n', '<br>').replace(' ', '  '))
+                train_metrics['test_report'].append(test_report_str.replace('\n', '<br>').replace(' ', '  '))
+
+                df_loss = pd.DataFrame(train_metrics)
+                df_loss = df_loss[df_loss['kfold'] == kfold]
+
+                # early stoping
+                patience = cfg_model['patience']
+
+                #df_loss['target_metric'] = df_loss['test_auc'] * np.sqrt(df_loss['test_auc'] * df_loss['train_auc']) * np.sqrt(df_loss['test_f1'] * df_loss['train_f1'])
+                df_loss['target_metric'] = df_loss['test_auc'] * df_loss['test_auc'] * np.sqrt(df_loss['test_f1'])
+                df_loss['is_improvement'] = df_loss['target_metric'] >= df_loss['target_metric'].max()
+
+                fig = plot_loss_metrics(df_loss, title=f'{arg_dataset} fold {kfold}')
+                fig.write_html(os.path.join(save_dir, 'losses.html'))
+
+                df_loss.sort_values(by='epoch', ascending=True, inplace=True)
+                df_loss.reset_index(inplace=True, drop=True)
+                epochs_since_improvement = epoch - df_loss.iloc[df_loss['is_improvement'].argmax()]['epoch']
+
+                # save .pth model checkpoint
+                if roc_auc_test > best_roc_auc_test:
+                    best_roc_auc_test=roc_auc_test
+                    save_checkpoint(model, save_dir, epoch=epoch)
+
+                if epochs_since_improvement >= patience:
+                    print(f"Early stopping triggered after {epoch + 1} epochs")
+                    break
+
